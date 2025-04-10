@@ -19,7 +19,6 @@
 # be printed as part of the commands within the logfile.
 # Be careful who you send this log to avoid credentials leaks!
 
-
 # TODO: idea wrap the curl request to use the standard options
 authenticated_request() {
 	:
@@ -30,8 +29,6 @@ authenticated_request() {
 create_badge() {
 	:
 }
-
-
 
 arc_registry_push() {
 	if [ -z "$arc_registry_endpoint" ] || [ -z "$arc_registry_token" ]; then
@@ -67,9 +64,10 @@ purge_badges() {
 
 ## MAIN
 
-# setup logging
+# setup logging & trap to clear uninteresting logfiles, if configured
 declare -rg log_file="/var/log/datahub/${0##*/}.$$.log"
 exec &> "$log_file"
+trap '[ "$?" = "2" ] && rm -f -- "$log_file"' EXIT
 
 # declare global variables
 declare -rg arc_validation_stage_name="arc_validation"
@@ -93,20 +91,6 @@ else
 	echo "DataHUB function file not found at '$datahub_functions'..."
 fi
 
-# Get the event from stdin 
-json="$(cat -)"
-
-event_type="$(jq -r '.object_kind // empty' <<< "$json")"
-event_name="$(jq -r '.event_name // empty' <<< "$json")"
-event_ref="$(jq -r '.object_attributes.ref // empty' <<< "$json")"
-event_id="$(jq -r '.object_attributes.id // empty' <<< "$json")"
-
-if { [ -n "$event_type" ] && [ "$event_type" != "pipeline" ]; } \
-	|| { [ -n "$event_name" ] && [ "$event_name" != "project_create" ]; }; then
-	echo "Ignoring $event_type | $event_name"
-	exit 0
-fi
-
 ## Preliminary checks are complete, let's read the configuration file
 . "$datahub_secrets"
 
@@ -120,13 +104,29 @@ if [ -z "$api_token" ]; then
 	exit 1
 fi
 
-# Handle debug mode
-if [ "$HOOK_DEBUG" = "1" ]; then
+shopt -s extglob
+
+if [ "$HOOK_DEBUG" -ge 1 ]; then
 	set -x
 fi
 
+# Get the event from stdin
+json="$(cat -)"
+
+event_type="$(jq -r '.object_kind // empty' <<< "$json")"
+event_name="$(jq -r '.event_name // empty' <<< "$json")"
+event_ref="$(jq -r '.object_attributes.ref // empty' <<< "$json")"
+event_id="$(jq -r '.object_attributes.id // empty' <<< "$json")"
+
+if { [ -n "$event_type" ] && [ "$event_type" != "pipeline" ]; } \
+	|| { [ -n "$event_name" ] && [ "$event_name" != "project_create" ]; }; then
+	echo "Ignoring $event_type | $event_name"
+	exit 2
+fi
+
+# for event_types the project id is in .project.id
 project_id="$(jq -r '.project.id // empty' <<< "$json")"
-# for the event "project_create" the project id is in .project_id
+# for event_name the project id is in .project_id
 [ -z "$project_id" ] && project_id="$(jq -r '.project_id // empty' <<< "$json")"
 
 project_name="$(jq -r '.project.path_with_namespace // empty' <<< "$json")"
@@ -154,7 +154,7 @@ if [ "$event_name" = "project_create" ]; then
 		}' \
 		"${CI_API_V4_URL}/projects/$project_id/badges"
 	)"
-	echo "pipeline badge creation: $ret"
+	echo "pipeline branch creation: $ret"
 
 fi
 
@@ -163,11 +163,6 @@ if [ "$event_type" = "pipeline" ]; then
 	if [ "$pipeline_status" != "manual" ] && [ "$pipeline_status" != "success" ] && [ "$pipeline_status" != "failed" ]; then
 		echo "Pipeline not done yet!"
 		exit 1
-	fi
-
-	if [ "$event_ref" = "$arc_badges_branch_name" ] || [ "$event_ref" = "master" ]; then
-		echo "Pushing event to the ARC registry...."
-		arc_registry_push
 	fi
 
 	ret="$(curl -k -L -o /dev/null -s -w "%{http_code}" \
@@ -194,8 +189,12 @@ if [ "$event_type" = "pipeline" ]; then
 		echo "$arc_quality_control_branch_name branch check: $ret"
 	fi
 
-	[ "$event_ref" = "$arc_badges_branch_name" ] && purge_badges
-	[ "$event_ref" = "master" ] && purge_badges
+	if [ "$event_ref" = "$arc_badges_branch_name" ] || [ "$event_ref" = "master" ]; then
+		echo "Cleaning badges..."
+		purge_badges
+		echo "Pushing event to the ARC registry...."
+		arc_registry_push
+	fi
 
 	commit_id="$(jq -r '.commit.id // empty' <<< "$json")"
 	if [ -z "$commit_id" ]; then
@@ -203,12 +202,7 @@ if [ "$event_type" = "pipeline" ]; then
 		exit 1
 	fi
 
-	job_ids=($(jq -r '.builds[] | select(.stage=="'"${arc_validation_stage_name}"'") | .id // empty' <<< "$json"))
-	if [ "${#job_ids[@]}" = 0 ]; then
-		echo "Failed to find job ids."
-		exit 1
-	fi
-
+	# prepare the commit json body
 	commit_payload='
 	{
 	  "branch": "'"$arc_quality_control_branch_name"'",
@@ -216,27 +210,55 @@ if [ "$event_type" = "pipeline" ]; then
 	  "actions": []
 	}'
 
-	for job_id in ${job_ids[@]}; do
-	
+	# parse the job names and their ids
+	declare -A ci_jobs
+	jq -r '.builds[] | select(.stage=="'"${arc_validation_stage_name}"'") | "\(.name) \(.id)"' <<< "$json"
+	while read -r line; do
+		read -r job_name job_id _ <<< "$line"
+		ci_jobs["${job_name#validate-}"]="$job_id"
+	done < <(jq -r '.builds[] | select(.stage=="'"${arc_validation_stage_name}"'") | "\(.name) \(.id)"' <<< "$json")
+	readonly ci_jobs
+	declare -p ci_jobs
+
+	if [ "${#ci_jobs[@]}" = 0 ]; then
+		echo "Failed to find jobs."
+		exit 1
+	fi
+
+	for job_name in "${!ci_jobs[@]}"; do
+		job_id="${ci_jobs["$job_name"]}"
 		tmp_dir="$(mktemp -d)"
 		cd "$tmp_dir"
+		echo "Fetching job (${job_id}) artifacts for project ${project_id}..."
 		job_artifacts_path="${project_id}.${job_id}.artifacts.zip"
-		ret="$(curl -k -L \
+		curl -k -L \
 			-H "PRIVATE-TOKEN: $api_token" \
 			"${CI_API_V4_URL}/projects/${project_id}/jobs/${job_id}/artifacts" \
 			> "$job_artifacts_path"
-		)"
-		echo "Fetching job (${job_id}) artifacts for project ${project_id} returned: $ret"
+		# the following is kinda lazy, TODO better
 		unzip "$job_artifacts_path"
+		if [ "$?" != 0 ]; then
+			# something went wrong with the job, skip
+			echo "Job ${job_id} did not create a valid zip. Skipping."
+			continue
+		fi
 		rm -f "$job_artifacts_path"
-		
-		validation_results=($(find . -type f -name "*.svg" -or -name "*.xml"))
-		for file in "${validation_results[@]}"; do
-	
-			file="${file:2}"
-			file_urlencoded="$(echo -n "$file" | jq -sRr @uri)"
 
-			ret="$(curl -k -L -s -o /dev/null \
+		# detect the name of the validation package through the result folder
+		# it should be: <branch>/<package>@<version>
+		validation_package_results_folder="$(find * -mindepth 1 -type d -name "*$job_name*")"
+		echo "Results: $validation_package_results_folder"
+		if [ ! -d "$validation_package_results_folder" ]; then
+			echo "Failed to find package result directory of $job_name..."
+			continue
+		fi
+
+		# we want to upload all the files created by the validation package
+		# in the quality control branch.
+		for file in "${validation_package_results_folder}/"*; do
+			echo "Working on file: $file"
+			file_urlencoded="$(echo -n "$file" | jq -sRr @uri)"
+			ret="$(curl -k -s -o /dev/null \
 				-w %{http_code} \
 				-H "Content-Type: application/json" \
 				-H "PRIVATE-TOKEN: $api_token" \
@@ -258,39 +280,51 @@ if [ "$event_type" = "pipeline" ]; then
 				' <<< "$commit_payload"
 	
 			)"
-			# check for svg suffix and only for the configured branch for badges
-			[ "$file" = "${file%.svg}" ] && continue
-			! ( [ "$event_ref" != "$arc_badges_branch_name" ] || [ "$event_ref" != "master" ] ) && continue
-			
-			badge_name="validation-$(echo -n ${file%%@*} | tr '/' '-')"
-			echo "badge name: $badge_name"
+			# Note: the actual commit is done after iterating over all jobs.
 
-			# TODO determine badge URL depending on the return code of the arc-validate tool and not only
-			# whether the get_publication_link function is defined or not
-			if declare -F "get_publication_link" > /dev/null; then
-				badge_url="$(get_publication_link)"
-			else
+			## Create badge if needed
+   			if [ "${file##*/}" = "badge.svg" ] && { [ "$event_ref" = "$arc_badges_branch_name" ] || [ "$event_ref" = "master" ]; }; then
+				# we'll use a hardcoded name of the badge here, eventually need to change that in the future
+				file="${validation_package_results_folder}/badge.svg"
+				if [ ! -f "$file" ]; then
+					echo "Badge not found at expected path: $file"
+					continue
+				fi
+
+				badge_name="validation-$(echo -n ${file%%@*} | tr '/' '-')"
+				echo "badge name: $badge_name"
+
+				# Determine the URL for the badge. Defaults to GitLab test report page
 				badge_url="${CI_SERVER_URL}/${project_name}/-/pipelines/${event_id}/test_report"
+				summary_file="${validation_package_results_folder}/validation_summary.json"
+				if [ "$badge_name" = "validation-main-invenio" ] && [ "$(jq -r .Critical.HasFailures "$summary_file")" = "false" ]; then
+					# Use the publication URL, if it is defined
+					if declare -F get_publication_link > /dev/null; then
+						badge_url="$(get_publication_link)"
+					fi
+				fi
+				if [ "$badge_name" = "validation-main-odrl" ] && [ -f "${validation_package_results_folder}/offer.pdf" ]; then
+					badge_url="${CI_SERVER_URL}/%{project_path}/-/blob/${arc_quality_control_branch_name}/${validation_package_results_folder}/offer.pdf"
+				fi
+				ret="$(curl -k -X POST \
+					-H "PRIVATE-TOKEN: $api_token" \
+					-H "Content-Type: application/json" \
+					-d '{
+						"name": "'"${badge_name}"'",
+						"link_url": "'"${badge_url}"'",
+						"image_url": "'"${CI_SERVER_URL}"'/%{project_path}/-/raw/'"${arc_quality_control_branch_name}"'/'"${file_urlencoded}"'?inline=false"
+					}' \
+					"${CI_API_V4_URL}/projects/$project_id/badges"
+				)"
+				echo "Badge creation returned: $ret"
 			fi
-			ret="$(curl -k -L -X POST \
-				-H "PRIVATE-TOKEN: $api_token" \
-				-H "Content-Type: application/json" \
-				-d '{
-					"name": "'"${badge_name}"'",
-					"link_url": "'"${badge_url}"'",
-					"image_url": "'"${CI_SERVER_URL}"'/%{project_path}/-/raw/'"${arc_quality_control_branch_name}"'/'"${file_urlencoded}"'?inline=false"
-				}' \
-				"${CI_API_V4_URL}/projects/$project_id/badges"
-		
-			)"
-			echo "Badge creation returned: $ret"
 		done
 
-		# cleanup artifact dir
+		# cleanup temporary job artifacts directory
 		cd -
 		rm -rf "$tmp_dir"
 	done
-	
+
 	ret="$(curl -k -L -X POST \
 	  -H "PRIVATE-TOKEN: $api_token" \
 	  -H "Content-Type: application/json" \

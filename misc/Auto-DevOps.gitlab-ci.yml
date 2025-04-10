@@ -1,3 +1,6 @@
+variables:
+  GIT_LFS_SKIP_SMUDGE: "1"
+
 workflow:
   rules:
     - if: '$CI_COMMIT_REF_NAME != "cqc"'
@@ -20,23 +23,30 @@ Create ARC JSON:
   variables:
     ARC_PATH: .
   script:
-    - /arc-export -p .
-    - ls -la
-    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file arc.json "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/isa_arc_json/0.0.1/arc.json"'
+    - /arc-export -f rocrate-metadata -f isa-json -f summary-markdown -p .
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file arc-isa.json "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/isa_arc_json/0.0.1/arc.json"'
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file arc-isa.json "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/isa_arc_json/0.0.1/arc-isa.json"'
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file arc-ro-crate-metadata.json "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/isa_arc_json/0.0.1/arc-ro-crate-metadata.json"'
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file arc-summary.md "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/isa_arc_json/0.0.1/arc-summary.md"'
   artifacts:
     when: always
     paths:
       - arc.json
+      - arc-isa.json
+      - arc-summary.md
+      - arc-ro-crate-metadata.json
 
 quality_report_generator:
   stage: quality_report_generator
   rules:
+    - if: $CI_COMMIT_REF_NAME != "cqc"
     - exists:
       - .arc/validation_packages.yml
   script:
-    - env
-    - apt update
-    - apt install -y yq
+    - |
+      if [ ! -e "${CI_PROJECT_DIR}/.arc/validation_packages.yml" ]; then
+        exit 0
+      fi
     - |
       cat << EOF > quality_reports.yml
       stages:
@@ -44,13 +54,36 @@ quality_report_generator:
         - generate_metadata
       EOF
     - |
+      arc_validation_spec="$(yq -r '.arc_specification // ""' ${CI_PROJECT_DIR}/.arc/validation_packages.yml)"
+      if [ -n "$arc_validation_spec" ]; then
+        cat << EOF >> quality_reports.yml
+      validate-arc:
+        stage: arc_validation
+        image: "ghcr.io/nfdi4plants/arc-validate:main"
+        script:
+          - arc-validate validate --specification-version "$arc_validation_spec"
+          - ret=$?
+          - mkdir -p "${CI_COMMIT_BRANCH}"
+          - mv ".arc-validate-results/${p}"* "${CI_COMMIT_BRANCH}"
+          - find "$CI_COMMIT_BRANCH" || true
+          - exit $ret
+        artifacts:
+          when: always
+          paths:
+            - $CI_COMMIT_BRANCH/*/*
+          reports:
+            junit:
+              - $CI_COMMIT_BRANCH/*/*.xml
+          expire_in: 1 hour
+      EOF
+      fi
       while read -r p v ; do
         install_command=("arc-validate" "package" "install" "$p")
         validate_command=("arc-validate" "validate" "-p" "$p")
         [ "$v" = "null" ] && v=""
         if [ -n "$v" ]; then
-          install_command+=("-pv" "$v")
-          validate_command+=("-pv" "$v")
+          install_command+=("-v" "$v")
+          validate_command+=("-v" "$v")
         fi
 
         cat << EOF >> quality_reports.yml
@@ -62,16 +95,16 @@ quality_report_generator:
           - ${validate_command[@]}
           - ret=$?
           - mkdir -p "${CI_COMMIT_BRANCH}"
-          - mv ".arc-validate-results/${p}" "${CI_COMMIT_BRANCH}/${p}${v:+@$v}"
+          - mv ".arc-validate-results/${p}"* "${CI_COMMIT_BRANCH}"
+          - find "$CI_COMMIT_BRANCH" || true
           - exit $ret
         artifacts:
           when: always
           paths:
-            - ${CI_COMMIT_BRANCH}/${p}${v:+@$v}/*.xml
-            - ${CI_COMMIT_BRANCH}/${p}${v:+@$v}/*.svg
+            - $CI_COMMIT_BRANCH/*/*
           reports:
             junit:
-              - ${CI_COMMIT_BRANCH}/${p}${v:+@$v}/*.xml
+              - $CI_COMMIT_BRANCH/*/*.xml
           expire_in: 1 hour
       EOF
         if [ "$p" = "invenio" ]; then
@@ -84,8 +117,7 @@ quality_report_generator:
         script:
           - echo "Creating publication metadata..."
           - arc-to-invenio -p .
-          - |
-            [ -e metadata.json ] || exit 1
+          - cat metadata.json || exit 1
         artifacts:
           when: always
           paths:

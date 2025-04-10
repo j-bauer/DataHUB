@@ -1,8 +1,10 @@
-# DataHUB Test Deployment
+# DataHUB Deployment
 
-In the future we plan to release a ready-to-use docker-compose.yml file but here are some first drafts of a basic setup using the DataHUB image.
+This repository contains the Dockerfile and the necessary scripts and patches to create the DataHUB docker image. It is recommended to use the packaged docker image.
 
-Note that currently the data folder in the current directory will be used to mount volumes for different aspects of the configuration & the data. This will be changed to some external, configurable mount point in the future. As it is the state is saved within ./data to facilitate testing and upgrade, while keeping the application state.
+Since the on-premise infrastructures vary greatly, we provide various examples of docker-compose.yml file in this README as a quick start. In case of assistance with more exotic setups, please contact us or write an issue and we will glady provide assistance.
+
+Note that in these examples, the `data` folder in the current directory is used to mount volumes for different aspects of the configuration & the data. For testing, it is enough to use a local folder. For production, it is recommended to use some kind of network storage or use storage volumes of your virtualisation solution as these are usually snapshotted/backed up in some way.
 
 For background information on the concept of the DataHUB see our [poster contribution to the 2023 CoRDI conference](https://doi.org/10.5281/zenodo.10021181), for the data publication workflow in conjunction with InvenioRDM see the IWSG conference paper.
 
@@ -12,11 +14,9 @@ We chose to use the Enterprise Edition of GitLab because it provides the most ea
 upgrade path to a non free version of GitLab if desired, and is therefore encouraged.
 It is important to note here, that the Enterprise Edition of GitLab is free and does not requiere a commercial subscription, and "in this case runs using the open source license" [[1]](https://handbook.gitlab.com/handbook/marketing/brand-and-product-marketing/product-and-solution-marketing/tiers/#history-of-ce-and-ee-distributions). The Community and Enterprise Edition of GitLab only refere to software distributuions, and using the one over the other does not indicate that one is paid or unpaid user of GitLab. More information can be found in [The GitLab Handbook](https://handbook.gitlab.com/handbook/marketing/brand-and-product-marketing/product-and-solution-marketing/tiers/).
 
-## Minimal working Version
+## Quick start docker-compose file
 
 ```
-version: '3.9'
-
 services:
   web:
     image: ghcr.io/nfdi4plants/datahub:main
@@ -269,7 +269,7 @@ CI_API_V4_URL="${CI_SERVER_URL}/api/v4"
 HOOK_DEBUG=1
 ```
 
-This configuration file is used to provide the acces token and the API endpoint to a script which is used to upload artifacts to GitLab repositories. It is also defines if debug logs should be keept. As this file needs to be accessible for the container, as well as a location to store the logs outside the container needs to be defined, the following addition need to be made to the docker compose file. In the following example, the configuration file mentioned is named "secrets.include". The directory containing the log files is named "datahub-logs"
+This configuration file is used to provide the acces token and the API endpoint to a script which is used to upload artifacts to GitLab repositories. It is also defines if debug logs should be keept. As this file needs to be accessible for the container, as well as a location to store the logs outside the container needs to be defined, the following addition need to be made to the docker compose file. In the following example, the configuration file mentioned is named "secrets.include". The directory containing the log files is named "datahub-logs". Make sure that the log directory is owned by the user `git` within the container otherwise the script won't be able to write the logfiles.
 
 ```
     volumes:
@@ -307,3 +307,30 @@ A job called "quality_report_generator" will be executed, which in turn will exe
 
 **Note:** The validation packages themselves are still a work in progress. Contact us if you need more information about which package would be available for testing.
 
+# DataHUB Update
+
+To upgrade your DataHUB, follow these steps:
+
+1. **Check Your GitLab Version**  
+   Find your current GitLab version in your instance under **Admin Area > Overview**.
+   These GitLab versions correspond to the DataHUB versions.
+
+2. **Determine the Upgrade Path**  
+   Use the [GitLab Upgrade Path](https://gitlab-com.gitlab.io/support/toolbox/upgrade-path/) to identify required intermediate/target versions.
+   
+   Alternatively, you can also follow all upgrades up to the latest one listed [here](https://github.com/nfdi4plants/DataHUB/pkgs/container/datahub/versions?filters%5Bversion_type%5D=tagged).
+   There should be at least one working upgrade path for each version, please let us know if something is missing.
+
+3. **Pull the Matching DataHUB Image**  
+   DataHUB Docker images are tagged with the **exact DataHUB version** they support. Update your compose file with the next available DataHUB version needed in your upgrade path.
+   ```bash
+    services:
+      web:
+        image: ghcr.io/nfdi4plants/datahub:<release>
+   ```  
+   Replace `<release>` with your target GitLab version (e.g., `16.10.1-ee.0`).  
+   Check available versions/tags:  
+   [GitHub Container Registry for DataHUB](https://github.com/nfdi4plants/DataHUB/pkgs/container/datahub).  
+
+4. **Deploy the Upgraded Image**  
+   Follow your existing deployment workflow to apply the new image.
