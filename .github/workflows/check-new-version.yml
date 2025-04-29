@@ -1,9 +1,9 @@
 name: Check new gitlab-ee versions and try to build the docker image
 
 on:
-  schedule:
-    - cron: '1 * * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '10 * * * *'
 
 jobs:
   check_version:
