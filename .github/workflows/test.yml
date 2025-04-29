@@ -3,7 +3,7 @@ name: Create and publish a Docker image when a new tag is created
 on:
   push:
     tags:
-      - 'v*'
+      - v*
 
 jobs:
   docker:
