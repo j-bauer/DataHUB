@@ -1,0 +1,31 @@
+on:
+  schedule:
+    - cron: '1 * * * *'
+
+jobs:
+  check_version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Check new gitlab-ee versions"
+        run: |
+          latest="$(curl -s "https://hub.docker.com/v2/repositories/gitlab/gitlab-ee/tags" \
+                  | jq -r '.results[].name | select(.|test("^[0-9]+"))' \
+                  | sort -V \
+                  | tail -1
+          )"
+          
+          echo "Detected latest version: $latest"
+          
+          if [ -z "$latest" ]; then
+                  echo "Could not find latest version, exiting."
+                  exit 1
+          fi               
+          
+          if [ -d "scripts/$latest" ]; then
+                  echo "scripts/$latest already exists, skipping."
+                  exit 0
+          fi
+          cp -r "$(readlink -f scripts/latest)" "scripts/$latest"
+          docker build --build-arg VERSION="$latest" -t "datahub-$latest" .
+
